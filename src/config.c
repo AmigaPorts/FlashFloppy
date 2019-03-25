@@ -9,34 +9,45 @@
  * See the file COPYING for more details, or visit <http://unlicense.org>.
  */
 
+/* Alphanumeric plus ",-_:" */
 static int isvalid(char c)
 {
-    return (((c >= 'A') && (c <= 'Z'))
-            || ((c >= 'a') && (c <= 'z'))
-            || ((c >= '0') && (c <= '9'))
-            || ((c == '-')));
+    const static char map[] = {
+        /* , (2c) - (2d) 0-9 (30-39) : (3a) A-Z (41-5a) _ (5f) a-z (61-7a) */
+        0x00, 0x00, 0x00, 0x00, /* 0x00-0x1f */
+        0x00, 0x0c, 0xff, 0xe0, /* 0x20-0x2f */
+        0x7f, 0xff, 0xff, 0xe1, /* 0x30-0x3f */
+        0x7f, 0xff, 0xff, 0xe0  /* 0x40-0x4f */
+    };
+    return ((c/8) < sizeof(map)) ? (int8_t)(map[c/8] << (c&7)) < 0 : FALSE;
 }
 
 int get_next_opt(struct opts *opts)
 {
     char *p, c;
     const struct opt *opt;
+    bool_t section;
 
     F_read(opts->file, &c, 1, NULL);
 next_line:
     if (c == '\0')
-        return -1; /* eof */
+        return OPT_eof;
     /* Skip leading whitespace. */
     while (isspace(c))
         F_read(opts->file, &c, 1, NULL);
 
     /* Option name parsing. */
+    section = (c == '['); /* "[section]" */
+    if (section)
+        F_read(opts->file, &c, 1, NULL);
     p = opts->arg;
     while (isvalid(c) && ((p-opts->arg) < (opts->argmax-1))) {
         *p++ = c;
         F_read(opts->file, &c, 1, NULL);
     }
     *p = '\0';
+    if (section)
+        return OPT_section;
     /* Look for a match in the accepted options list. */
     for (opt = opts->opts; opt->name; opt++)
         if (!strcmp(opt->name, opts->arg))
@@ -63,7 +74,7 @@ next_line:
             F_read(opts->file, &c, 1, NULL);
         }
     } else {
-        /* Non-quoted value: pretty much alphanumeric only is accepted. */
+        /* Non-quoted value: restricted character set. */
         while (isvalid(c) && ((p-opts->arg) < (opts->argmax-1))) {
             *p++ = c;
             F_read(opts->file, &c, 1, NULL);

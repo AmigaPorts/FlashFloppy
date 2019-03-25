@@ -21,6 +21,8 @@ struct opts {
 };
 
 int get_next_opt(struct opts *opts);
+#define OPT_eof -1
+#define OPT_section -2
 
 /* FF.CFG options structure. */
 struct __packed ff_cfg {
@@ -122,6 +124,7 @@ struct __packed ff_cfg {
     uint8_t pin02, pin34;
     uint8_t head_settle_ms;
     uint8_t oled_contrast;
+    char indexed_prefix[8];
 };
 
 extern struct ff_cfg ff_cfg;
