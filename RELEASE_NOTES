@@ -3,6 +3,44 @@
 ** Keir Fraser <keir.xen@gmail.com>
 ************************************
 
+** v2.4a - 9 April 2019
+ - This release fixes many raw track formats (SSD, DSD, OPD, VDK, ...)
+   - Thanks to John Gray for bug report, and testing!
+ - RAW: Fix FM track generation
+   - FM and IAM flags not plumbed through from front-end image handlers
+ - RAW: Fix interleaved/skewed track generation
+   - Data fetch not loading sectors from image file in the right order
+
+** v2.3a - 8 April 2019
+ - OLED: Auto-detect SSD1306 vs SH1106 display controller
+   - FF.CFG: 'display-type = ...-sh1106' is now redundant and ignored
+ - ATR: Fix readability of downloaded ATR images
+   - Invert data as it is read/written, mirroring the standard XF551 interface
+   - Thanks to Piotr for this report (using his XF551 clone)
+
+** v2.2a - 5 April 2019
+ - New image types supported:
+   - XDF: 3.5" HD eXtended Disk Format (1840kB)
+   - ATR: Atari 8-bit
+ - 7-Seg LED: Improved track display.
+   - Remove option 'led-trk' from FF.CFG. Track display mode is always on.
+ - OLED: Fix horizontal offset on SH1106 128x32 displays
+ - IMG.CFG: 'id' parameter simplified; 'sskew' renamed 'hskew' (head skew)
+ 
+** v2.1a - 26 March 2019
+ - IMG.CFG: Allow up to 256 sectors per track
+ - IMG.CFG: Split skew into per-cylinder and per-side values (cskew/sskew)
+ - IMG.CFG: Introduce image-file layout option (file-layout=<csv-list>):
+   - sequential,interleaved: Cylinder-first or side-first track ordering
+   - reverse-sideN: Side-N cylinders in reverse order (high to low) (N=0,1)
+   - sides-swapped: Ordering of disk sides is swapped in the image file
+ - 7-Segment LED: Display track number when an image is mounted
+   - FF.CFG: "display-type = led-trk"
+   - Displays slot number as usual during image selection/navigation
+   - First button press reverts to slot display; Next press begins navigation
+ - LCD/OLED: Display full cylinder number on displays wider than 16 columns
+   - Previously truncated at cylinder 99
+
 ** v2.0a - 14 March 2019
  - IMG: Allow geometry to be manually configured in new file IMG.CFG
    - See examples/IMG.CFG for documentation

@@ -10,6 +10,7 @@
  */
 
 extern const struct image_handler adf_image_handler;
+extern const struct image_handler atr_image_handler;
 extern const struct image_handler hfe_image_handler;
 extern const struct image_handler img_image_handler;
 extern const struct image_handler st_image_handler;
@@ -29,10 +30,12 @@ extern const struct image_handler sdu_image_handler;
 extern const struct image_handler jvc_image_handler;
 extern const struct image_handler vdk_image_handler;
 extern const struct image_handler ti99_image_handler;
+extern const struct image_handler xdf_image_handler;
 extern const struct image_handler dummy_image_handler;
 
 const struct image_type image_type[] = {
     { "adf", &adf_image_handler },
+    { "atr", &atr_image_handler },
     { "d81", &d81_image_handler },
     { "dsk", &dsk_image_handler },
     { "hdm", &pc98hdm_image_handler },
@@ -53,6 +56,7 @@ const struct image_type image_type[] = {
     { "jvc", &jvc_image_handler },
     { "vdk", &vdk_image_handler },
     { "v9t9", &ti99_image_handler },
+    { "xdf", &xdf_image_handler },
     { "", NULL }
 };
 
@@ -114,12 +118,9 @@ void image_open(struct image *im, const struct slot *slot)
     static const struct image_handler * const image_handlers[] = {
         /* Special handler for dummy slots (empty HxC slot 0). */
         &dummy_image_handler,
-        /* Formats with an identifying header. */
+        /* Only put formats here that have a strong identifying header. */
         &dsk_image_handler,
-        &hfe_image_handler,
-        /* Header-less formats in some semblance of priority order. */
-        &adf_image_handler,
-        &img_image_handler
+        &hfe_image_handler
     };
 
     char ext[sizeof(slot->type)+1];
@@ -136,6 +137,7 @@ void image_open(struct image *im, const struct slot *slot)
         if (!strcmp(ext, type->ext))
             break;
     hint = type->handler;
+    if (hint == NULL)
 
     /* Apply host-specific overrides to the hint. */
     switch (ff_cfg.host) {
@@ -149,13 +151,18 @@ void image_open(struct image *im, const struct slot *slot)
         break;
     }
 
-    if (hint) {
+    while (hint != NULL) {
         if (try_handler(im, slot, hint))
             return;
-        /* Hint failed. Try a secondary hint (allows DSK fallback to IMG). */
-        hint = !strcmp(ext, "dsk") ? &img_image_handler : NULL;
-        if (hint && try_handler(im, slot, hint))
-            return;
+        /* Hint failed. Try a secondary hint. */
+        if (hint == &img_image_handler)
+            /* IMG,IMA,DSK -> XDF */
+            hint = &xdf_image_handler;
+        else if (!strcmp(ext, "dsk")) 
+            /* DSK -> IMG */
+            hint = &img_image_handler;
+        else
+            hint = NULL;
     }
 
     /* Filename extension hinting failed: walk the handler list. */
