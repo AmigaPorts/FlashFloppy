@@ -60,15 +60,14 @@ struct track_header {
     uint16_t len;
 };
 
-/* HFEv3 opcodes */
+/* HFEv3 opcodes. The 4-bit codes have their bit ordering reversed. */
 enum {
-    OP_nop = 0,     /* no effect */
-    OP_index = 8,   /* index mark */
-    OP_bitrate = 4, /* +1byte: new bitrate */
-    OP_skip = 12    /* +1byte: skip 0-8 bits in next byte */
+    OP_nop = 0,     /* 0: no effect */
+    OP_index = 8,   /* 1: index mark */
+    OP_bitrate = 4, /* 2: +1byte: new bitrate */
+    OP_skip = 12,   /* 3: +1byte: skip 0-8 bits in next byte */
+    OP_rand = 2     /* 4: flaky byte */
 };
-
-#define RDATA_BUFLEN 16384
 
 static void hfe_seek_track(struct image *im, uint16_t track);
 
@@ -105,6 +104,11 @@ static bool_t hfe_open(struct image *im)
     im->ticks_per_cell = im->write_bc_ticks * 16;
     im->sync = SYNC_none;
 
+    ASSERT(8*512 <= im->bufs.read_data.len);
+    volume_cache_init(im->bufs.read_data.p + 8*512,
+                      im->bufs.read_data.p + im->bufs.read_data.len);
+    volume_cache_metadata_only(&im->fp);
+
     /* Get an initial value for ticks per revolution. */
     hfe_seek_track(im, 0);
 
@@ -130,6 +134,7 @@ static void hfe_setup_track(
     struct image *im, uint16_t track, uint32_t *start_pos)
 {
     struct image_buf *rd = &im->bufs.read_data;
+    struct image_buf *bc = &im->bufs.read_bc;
     uint32_t sys_ticks;
     uint8_t cyl = track/2, side = track&1;
 
@@ -151,21 +156,23 @@ static void hfe_setup_track(
     sys_ticks = im->cur_ticks / 16;
 
     rd->prod = rd->cons = 0;
+    bc->prod = bc->cons = 0;
 
     /* Aggressively batch our reads at HD data rate, as that can be faster 
      * than some USB drives will serve up a single block.*/
     im->hfe.batch_secs = (im->write_bc_ticks > sysclk_ns(1500)) ? 2 : 8;
-    ASSERT(RDATA_BUFLEN + im->hfe.batch_secs*512 <= im->bufs.read_data.len);
 
     if (start_pos) {
         /* Read mode. */
         im->hfe.trk_pos = (im->cur_bc/8) & ~255;
         image_read_track(im);
-        rd->cons = im->cur_bc & 2047;
+        bc->cons = im->cur_bc & 2047;
         *start_pos = sys_ticks;
     } else {
         /* Write mode. */
         im->hfe.trk_pos = im->cur_bc / 8;
+        im->hfe.write.start = im->hfe.trk_pos;
+        im->hfe.write.wrapped = FALSE;
         im->hfe.write_batch.len = 0;
         im->hfe.write_batch.dirty = FALSE;
     }
@@ -173,86 +180,106 @@ static void hfe_setup_track(
 
 static bool_t hfe_read_track(struct image *im)
 {
-    const unsigned int buflen = RDATA_BUFLEN, bufmask = buflen - 1;
     struct image_buf *rd = &im->bufs.read_data;
+    struct image_buf *bc = &im->bufs.read_bc;
     uint8_t *buf = rd->p;
-    unsigned int i, nr_sec;
+    uint8_t *bc_b = bc->p;
+    uint32_t bc_len, bc_mask, bc_space, bc_p, bc_c;
+    unsigned int nr_sec;
 
-    nr_sec = min_t(unsigned int, im->hfe.batch_secs,
-                   (im->hfe.trk_len+255 - im->hfe.trk_pos) / 256);
-    if ((uint32_t)(rd->prod - rd->cons) > (buflen - nr_sec*256) * 8)
-        return FALSE;
-
-    F_lseek(&im->fp, im->hfe.trk_off * 512 + im->hfe.trk_pos * 2);
-    F_read(&im->fp, &buf[buflen], nr_sec*512, NULL);
-
-    for (i = 0; i < nr_sec; i++) {
-        memcpy(&buf[(rd->prod/8) & bufmask],
-               &buf[buflen + i*512 + (im->cur_track&1)*256],
-               256);
-        barrier(); /* write data /then/ update producer */
-        rd->prod += 256*8;
+    if (rd->prod == rd->cons) {
+        nr_sec = min_t(unsigned int, im->hfe.batch_secs,
+                       (im->hfe.trk_len+255 - im->hfe.trk_pos) / 256);
+        F_lseek(&im->fp, im->hfe.trk_off * 512 + im->hfe.trk_pos * 2);
+        F_read(&im->fp, buf, nr_sec*512, NULL);
+        rd->cons = 0;
+        rd->prod = nr_sec;
+        im->hfe.trk_pos += nr_sec * 256;
+        if (im->hfe.trk_pos >= im->hfe.trk_len)
+            im->hfe.trk_pos = 0;
     }
 
-    im->hfe.trk_pos += nr_sec * 256;
-    if (im->hfe.trk_pos >= im->hfe.trk_len)
-        im->hfe.trk_pos = 0;
+    /* Fill the raw-bitcell ring buffer. */
+    bc_p = bc->prod / 8;
+    bc_c = bc->cons / 8;
+    bc_len = bc->len;
+    bc_mask = bc_len - 1;
+    bc_space = bc_len - (uint16_t)(bc_p - bc_c);
+
+    nr_sec = min_t(unsigned int, rd->prod - rd->cons, bc_space/256);
+    if (nr_sec == 0)
+        return FALSE;
+
+    while (nr_sec--) {
+        memcpy(&bc_b[bc_p & bc_mask],
+               &buf[rd->cons*512 + (im->cur_track&1)*256],
+               256);
+        rd->cons++;
+        bc_p += 256;
+    }
+
+    barrier();
+    bc->prod = bc_p * 8;
 
     return TRUE;
 }
 
 static uint16_t hfe_rdata_flux(struct image *im, uint16_t *tbuf, uint16_t nr)
 {
-    const unsigned int buflen = RDATA_BUFLEN, bufmask = buflen - 1;
-    struct image_buf *rd = &im->bufs.read_data;
+    struct image_buf *bc = &im->bufs.read_bc;
+    uint8_t *bc_b = bc->p;
+    uint32_t bc_c = bc->cons, bc_p = bc->prod, bc_mask = bc->len - 1;
     uint32_t ticks = im->ticks_since_flux;
     uint32_t ticks_per_cell = im->ticks_per_cell;
     uint32_t y = 8, todo = nr;
-    uint8_t x, *buf = rd->p;
+    uint8_t x;
     bool_t is_v3 = im->hfe.is_v3;
 
-    while ((rd->prod - rd->cons) >= 3*8) {
+    while ((uint32_t)(bc_p - bc_c) >= 3*8) {
         ASSERT(y == 8);
         if (im->cur_bc >= im->tracklen_bc) {
             ASSERT(im->cur_bc == im->tracklen_bc);
             im->tracklen_ticks = im->cur_ticks;
             im->cur_bc = im->cur_ticks = 0;
             /* Skip tail of current 256-byte block. */
-            rd->cons = (rd->cons + 256*8-1) & ~(256*8-1);
+            bc_c = (bc_c + 256*8-1) & ~(256*8-1);
             continue;
         }
-        y = rd->cons % 8;
-        x = buf[(rd->cons/8) & bufmask] >> y;
+        y = bc_c % 8;
+        x = bc_b[(bc_c/8) & bc_mask] >> y;
         if (is_v3 && (y == 0) && ((x & 0xf) == 0xf)) {
             /* V3 byte-aligned opcode processing. */
             switch (x >> 4) {
             case OP_nop:
             case OP_index:
-                rd->cons += 8;
+            default:
+                bc_c += 8;
                 im->cur_bc += 8;
                 y = 8;
                 continue;
             case OP_bitrate:
-                x = _rbit32(buf[(rd->cons/8+1) & bufmask]) >> 24;
+                x = _rbit32(bc_b[(bc_c/8+1) & bc_mask]) >> 24;
                 im->ticks_per_cell = ticks_per_cell = 
                     (sysclk_us(2) * 16 * x) / 72;
-                rd->cons += 2*8;
+                bc_c += 2*8;
                 im->cur_bc += 2*8;
                 y = 8;
                 continue;
             case OP_skip:
-                x = (_rbit32(buf[(rd->cons/8+1) & bufmask]) >> 24) & 7;
-                rd->cons += 2*8 + x;
+                x = (_rbit32(bc_b[(bc_c/8+1) & bc_mask]) >> 24) & 7;
+                bc_c += 2*8 + x;
                 im->cur_bc += 2*8 + x;
-                y = rd->cons % 8;
-                x = buf[(rd->cons/8) & bufmask] >> y;
+                y = x;
+                x = bc_b[(bc_c/8) & bc_mask] >> y;
                 break;
-            default:
-                /* ignore and process as normal data */
+            case OP_rand:
+                bc_c += 8;
+                im->cur_bc += 8;
+                x = rand();
                 break;
             }
         }
-        rd->cons += 8 - y;
+        bc_c += 8 - y;
         im->cur_bc += 8 - y;
         im->cur_ticks += (8 - y) * ticks_per_cell;
         while (y < 8) {
@@ -269,7 +296,7 @@ static uint16_t hfe_rdata_flux(struct image *im, uint16_t *tbuf, uint16_t nr)
     }
 
 out:
-    rd->cons -= 8 - y;
+    bc->cons = bc_c - (8 - y);
     im->cur_bc -= 8 - y;
     im->cur_ticks -= (8 - y) * ticks_per_cell;
     im->ticks_since_flux = ticks;
@@ -345,6 +372,7 @@ static bool_t hfe_write_track(struct image *im)
         if (im->hfe.trk_pos >= im->hfe.trk_len) {
             ASSERT(im->hfe.trk_pos == im->hfe.trk_len);
             im->hfe.trk_pos = 0;
+            im->hfe.write.wrapped = TRUE;
         }
     }
 
@@ -367,6 +395,10 @@ static bool_t hfe_write_track(struct image *im)
         im->hfe.write_batch.len = 0;
         im->hfe.write_batch.dirty = FALSE;
     }
+
+    if (flush && im->hfe.write.wrapped
+        && (im->hfe.trk_pos > im->hfe.write.start))
+        printk("Wrapped (%u > %u)\n", im->hfe.trk_pos, im->hfe.write.start);
 
     wr->cons = c * 8;
 

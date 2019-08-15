@@ -94,16 +94,20 @@ struct __packed ff_cfg {
 #define DISPLAY_narrower (1<<0)
 #define DISPLAY_rotate   (1<<2)
 #define DISPLAY_narrow   (1<<3)
- /*#define DISPLAY_sh1106   (1<<4) legacy unused */
+#define DISPLAY_ztech    (1<<4)
 #define DISPLAY_oled_64  (1<<5)
 /* Only if DISPLAY_lcd: */
 #define _DISPLAY_lcd_columns 5
 #define DISPLAY_lcd_columns(x) ((x)<<_DISPLAY_lcd_columns)
+#define _DISPLAY_lcd_rows   11
+#define DISPLAY_lcd_rows(x) ((x)<<_DISPLAY_lcd_rows)
     uint16_t display_type;
-#define ROT_none    0
-#define ROT_full    1
-#define ROT_half    3
-#define ROT_quarter 2
+#define ROT_none      0
+#define ROT_full      1
+#define ROT_half      3
+#define ROT_quarter   2
+#define ROT_trackball 4
+#define ROT_buttons   5
 #define ROT_reverse (1u<<7)
     uint8_t rotary;
     bool_t write_protect;
@@ -128,12 +132,31 @@ struct __packed ff_cfg {
     uint8_t oled_contrast;
     char indexed_prefix[8];
     uint8_t display_mode;
+#define SORT_never  0
+#define SORT_always 1
+#define SORT_small  2
+    uint8_t folder_sort;
+#define MOTOR_ignore 0xff
+    uint8_t motor_delay; /* / 10ms */
+#define SORTPRI_folders 0
+#define SORTPRI_files   1
+#define SORTPRI_none    2
+    uint8_t sort_priority;
+#define CHGRST_step   0xff
+#define CHGRST_pa14   0x8e
+#define CHGRST_delay(x) (x)
+    uint8_t chgrst;
+#define DORD_default 0xffff
+#define DORD_shift   4
+#define DORD_row     7
+#define DORD_double  8
+    uint16_t display_order;
 };
 
 extern struct ff_cfg ff_cfg;
 extern const struct ff_cfg dfl_ff_cfg;
 
-void flash_ff_cfg_update(void);
+void flash_ff_cfg_update(void *scratch);
 void flash_ff_cfg_erase(void);
 void flash_ff_cfg_read(void);
 

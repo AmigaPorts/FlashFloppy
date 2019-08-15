@@ -69,6 +69,7 @@ void *memcpy(void *dest, const void *src, size_t n);
 void *memmove(void *dest, const void *src, size_t n);
 int memcmp(const void *s1, const void *s2, size_t n);
 
+size_t strlen(const char *s);
 size_t strnlen(const char *s, size_t maxlen);
 int strcmp(const char *s1, const char *s2);
 int strncmp(const char *s1, const char *s2, size_t n);
@@ -80,6 +81,11 @@ int toupper(int c);
 int isspace(int c);
 
 long int strtol(const char *nptr, char **endptr, int base);
+
+void qsort_p(void *base, unsigned int nr,
+             int (*compar)(const void *, const void *));
+
+uint32_t rand(void);
 
 int vsnprintf(char *str, size_t size, const char *format, va_list ap)
     __attribute__ ((format (printf, 3, 0)));
@@ -105,27 +111,33 @@ void arena_init(void);
 /* Board-specific callouts */
 void board_init(void);
 
-#ifndef NDEBUG
-
-/* Serial console control */
-void console_init(void);
-void console_sync(void);
-void console_crash_on_input(void);
-
-/* Serial console output */
+#if !defined(NDEBUG) || defined(LOGFILE)
+/* Log output, to serial console or logfile. */
 int vprintk(const char *format, va_list ap)
     __attribute__ ((format (printf, 1, 0)));
 int printk(const char *format, ...)
     __attribute__ ((format (printf, 1, 2)));
+#else /* NDEBUG && !LOGFILE */
+static inline int vprintk(const char *format, va_list ap) { return 0; }
+static inline int printk(const char *format, ...) { return 0; }
+#endif
 
+#if defined(LOGFILE)
+/* Logfile management */
+void logfile_flush(FIL *file);
+#else /* !LOGFILE */
+#define logfile_flush(f) ((void)0)
+#endif
+
+#if !defined(NDEBUG)
+/* Serial console control */
+void console_init(void);
+void console_sync(void);
+void console_crash_on_input(void);
 #else /* NDEBUG */
-
 #define console_init() ((void)0)
 #define console_sync() IRQ_global_disable()
 #define console_crash_on_input() ((void)0)
-static inline int vprintk(const char *format, va_list ap) { return 0; }
-static inline int printk(const char *format, ...) { return 0; }
-
 #endif
 
 /* CRC-CCITT */
@@ -135,7 +147,7 @@ uint16_t crc16_ccitt(const void *buf, size_t len, uint16_t crc);
 void display_init(void);
 extern uint8_t display_mode;
 #define DM_NONE     0
-#define DM_LCD_1602 1
+#define DM_LCD_OLED 1
 #define DM_LED_7SEG 2
 
 /* Speaker. */
@@ -144,6 +156,7 @@ void speaker_pulse(void);
 
 /* Display: 3-digit 7-segment display */
 void led_7seg_init(void);
+void led_7seg_write_raw(const uint8_t *d);
 void led_7seg_write_string(const char *p);
 void led_7seg_write_decimal(unsigned int val);
 void led_7seg_display_setting(bool_t enable);
@@ -166,9 +179,10 @@ bool_t usbh_msc_inserted(void);
 /* Navigation/UI frontend */
 uint16_t get_slot_nr(void);
 bool_t set_slot_nr(uint16_t slot_nr);
-int set_slot_by_name(const char *name, void *scratch);
+void set_slot_name(const char *name);
 bool_t get_img_cfg(struct slot *slot);
 
+extern bool_t menu_mode;
 extern uint8_t board_id;
 
 /* Gotek board revisions */
@@ -182,6 +196,7 @@ extern const char fw_ver[];
 
 /* Text/data/BSS address ranges. */
 extern char _stext[], _etext[];
+extern char _smaintext[], _emaintext[];
 extern char _sdat[], _edat[], _ldat[];
 extern char _sbss[], _ebss[];
 
@@ -197,14 +212,13 @@ void EXC_unused(void);
 #define FLOPPY_IRQ_SEL_PRI    1
 #define FLOPPY_IRQ_WGATE_PRI  2
 #define FLOPPY_IRQ_STEP_PRI   3
-#define FLOPPY_IRQ_SIDE_PRI   4
-#define FLOPPY_IRQ_HI_PRI     3
 #define TIMER_IRQ_PRI         4
 #define WDATA_IRQ_PRI         7
 #define RDATA_IRQ_PRI         8
 #define FLOPPY_SOFTIRQ_PRI    9
 #define I2C_IRQ_PRI          13
 #define USB_IRQ_PRI          14
+#define CONSOLE_IRQ_PRI      15
 
 /*
  * Local variables:

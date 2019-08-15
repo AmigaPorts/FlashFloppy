@@ -3,6 +3,95 @@
 ** Keir Fraser <keir.xen@gmail.com>
 ************************************
 
+** v3.3a - 8 July 2019
+ - FF.CFG: New Disk-Change Reset option: chgrst=delay-N
+   - Automatically clears the DSKCHG signal Nx0.5s after disk insertion
+   - chgrst=delay-3 fixes Disk Change on Ensoniq EPS synths
+ - Change head-step signal handling to reduce interrupt rate
+ - OLED/LCD: Fix current-folder display line for image-on-startup=init|static
+ - image-on-startup=static: The static image is now specified in INIT_A.CFG
+
+** v3.2a - 25 June 2019
+ - OLED: New default layout for 128x64 displays
+ - LCD: Support 20x4 character displays
+ - LCD: Row ordering is configurable
+   - FF.CFG: Rename oled-text= to display-order= to reflect this
+ - Eject menu: Confirmation required for Delete/Clone operations
+ - Trackball: Reduce jitteriness by adding simple inertia
+
+** v3.1a - 13 June 2019
+ - OLED: Text height and content can be configured (FF.CFG:oled-text=)
+   - New default for 128x64 displays presents a new third text row
+ - LCD/OLED: Present an action menu when an image is ejected
+   - Includes Clone and Delete Image operations
+
+** v3.0a - 10 June 2019
+ - Disk Change Reset: Emulate explicit Reset signal of certain vintage drives
+   - Requires a hardware modification and FF.CFG: chgrst=pa14
+ - Support ZHONGJY_TECH 2.23" 128x32 displays based on SSD1305 controller
+   - FF.CFG: display-type=oled-128x32-ztech
+
+** v2.13 - 7 June 2019
+ - HFE: Fix read buffering error
+ - Update HxC Compat to v6-FF
+   - More robust error checking on writes
+
+** v2.12 - 2 June 2019
+ - HFEv3: Support flaky/weak bytes
+ - LCD/OLED: Improve power-on initialisation robustness
+ - Roland: Direct support for *.OUT images
+ - IO-Test: New alternative firmware to test Gotek I/O pins
+   - https://github.com/keirf/FlashFloppy/wiki/Testing-IO-Pins
+
+** v2.11a - 23 May 2019
+ - Simpler bootloader update process with all-in-one update file
+ - Update firmware via SD card (enhanced Goteks with SD card slot)
+ - FF.CFG: sort-priority= to prioritise folders vs files during navigation
+   - Default: Folders are listed before files
+
+** v2.10a - 20 May 2019
+ - Fix breakages since v2.2a:
+   - host=acorn: *.ADF handling
+   - host=tandy-coco: *.DSK handling
+
+** v2.9a - 17 May 2019
+ - FF.CFG: New option motor-delay= to provide emulation of motor behaviour
+   - Requires modification of a standard Gotek PCB (see Wiki: Hardware Mods)
+ - Debug logging: An alternative firmware is provided to log to FFLOG.TXT
+   - Find the alternative update file in alt/logfile/
+   - Use this for personal interest or as directed by me for debugging
+   - Not for general use!
+ - IMG/DSK: Better RAM handling (more space for mass-storage block cache)
+ - Code optimisation (MFM decode speeded up 4x)
+ - Small fix to generate INDEX signal when starting read near end of track
+
+** v2.8a - 10 May 2019
+ - DSK, IMG: Fix small error in generated MFM data
+ - Increase write buffer to 32kB, enough for a full high-density track
+   - More reliable whole-track writes, especially to HFE images
+ 
+** v2.7a - 23 April 2019
+ - Sort folders into alphabetical order during direct navigation
+   - FF.CFG: folder-sort= to modify this new default behaviour
+ - Fix memory corruption issues (stack overflow)
+ - ATR: Interleave sectors for best performance over slow SIO interface
+
+** v2.6a - 14 April 2019
+ - Fix feature breakages in v2.5a
+   - SSD/DSD/TRD auto-extend feature
+   - FF.CFG: eject-on-startup=yes feature
+ - Update HxC Compat to v5-FF
+
+** v2.5a - 12 April 2019
+ - Fragment-offsets cache implemented at the FAT filesystem layer
+ - Block cache implemented at the mass-storage volume layer
+   - Faster image selection/navigation in large folders
+   - Improved reliability in image handling (reduced access latencies)
+   - USB stick will usually stop flashing when drive is not being accessed!
+ - FF.CFG: New rotary input options
+   - 'trackball': Blackberry-style trackball
+   - 'buttons': Push-to-ground Prev/Next buttons
+
 ** v2.4a - 9 April 2019
  - This release fixes many raw track formats (SSD, DSD, OPD, VDK, ...)
    - Thanks to John Gray for bug report, and testing!

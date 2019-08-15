@@ -49,6 +49,7 @@ void IRQ_14(void) __attribute__((alias("IRQ_dma1_ch4_tc")));
 static uint8_t _bl;
 static uint8_t i2c_addr;
 static uint8_t i2c_dead;
+static uint8_t i2c_row;
 static bool_t is_oled_display;
 static uint8_t oled_height;
 
@@ -65,10 +66,13 @@ static volatile uint8_t refresh_count;
 static uint8_t buffer[256] __aligned(4);
 
 /* Text buffer, rendered into I2C data and placed into buffer[]. */
-static char text[2][40];
+static char text[4][40];
 
 /* Columns and rows of text. */
 uint8_t lcd_columns, lcd_rows;
+
+/* Affects default OLED 128x64 layout. */
+bool_t menu_mode;
 
 /* Occasionally the I2C/DMA engine seems to get stuck. Detect this with 
  * a timeout timer and unwedge it by calling the I2C error handler. */
@@ -153,16 +157,25 @@ static void emit8(uint8_t **p, uint8_t val, uint8_t signals)
 /* Snapshot text buffer into the command buffer. */
 static unsigned int lcd_prep_buffer(void)
 {
+    const static uint8_t row_offs[] = { 0x00, 0x40, 0x14, 0x54 };
+    uint16_t order;
+    char *p;
     uint8_t *q = buffer;
-    unsigned int i, j;
+    unsigned int i, row;
 
-    /* We transmit complete display on every DMA. */
-    refresh_count++;
+    order = (ff_cfg.display_order != DORD_default) ? ff_cfg.display_order
+        : (lcd_rows == 2) ? 0x7710 : 0x2103;
 
-    for (i = 0; i < lcd_rows; i++) {
-        emit8(&q, CMD_SETDDRADDR | (i*64), 0);
-        for (j = 0; j < lcd_columns; j++)
-            emit8(&q, text[i][j], _RS);
+    row = (order >> (i2c_row * DORD_shift)) & DORD_row;
+    p = (row < ARRAY_SIZE(text)) ? text[row] : NULL;
+
+    emit8(&q, CMD_SETDDRADDR | row_offs[i2c_row], 0);
+    for (i = 0; i < lcd_columns; i++)
+        emit8(&q, p ? *p++ : ' ', _RS);
+
+    if (++i2c_row >= lcd_rows) {
+        i2c_row = 0;
+        refresh_count++;
     }
 
     return q - buffer;
@@ -273,8 +286,7 @@ static uint8_t i2c_probe_range(uint8_t s, uint8_t e)
 
 void lcd_clear(void)
 {
-    lcd_write(0, 0, -1, "");
-    lcd_write(0, 1, -1, "");
+    memset(text, ' ', sizeof(text));
 }
 
 void lcd_write(int col, int row, int min, const char *str)
@@ -282,10 +294,6 @@ void lcd_write(int col, int row, int min, const char *str)
     char c, *p;
     uint32_t oldpri;
 
-    if (row < 0)
-        row += lcd_rows;
-    if (col < 0)
-        col += lcd_columns;
     if (min < 0)
         min = lcd_columns;
 
@@ -321,6 +329,9 @@ bool_t lcd_init(void)
 {
     uint8_t a, *p;
     bool_t reinit = (i2c_addr != 0);
+
+    i2c_dead = FALSE;
+    i2c_row = 0;
 
     rcc->apb1enr |= RCC_APB1ENR_I2C2EN;
 
@@ -384,17 +395,19 @@ bool_t lcd_init(void)
             : (ff_cfg.display_type & DISPLAY_lcd) ? FALSE
             : ((a&~1) == OLED_ADDR);
 
-        lcd_rows = 2;
-
         if (is_oled_display) {
             oled_height = (ff_cfg.display_type & DISPLAY_oled_64) ? 64 : 32;
             lcd_columns = (ff_cfg.oled_font == FONT_8x16) ? 16
                 : (ff_cfg.display_type & DISPLAY_narrower) ? 16
                 : (ff_cfg.display_type & DISPLAY_narrow) ? 18 : 21;
+            lcd_rows = 4;
         } else {
             lcd_columns = (ff_cfg.display_type >> _DISPLAY_lcd_columns) & 63;
             lcd_columns = max_t(uint8_t, lcd_columns, 16);
             lcd_columns = min_t(uint8_t, lcd_columns, 40);
+            lcd_rows = (ff_cfg.display_type >> _DISPLAY_lcd_rows) & 7;
+            lcd_rows = max_t(uint8_t, lcd_rows, 2);
+            lcd_rows = min_t(uint8_t, lcd_rows, 4);
         }
 
         printk("I2C: %s found at 0x%02x\n",
@@ -528,8 +541,6 @@ static void oled_convert_text_row(char *pc)
         oled_convert_text_row_6x13(pc);
 }
 
-static uint8_t oled_row;
-
 static unsigned int oled_queue_cmds(
     uint8_t *buf, const uint8_t *cmds, unsigned int nr)
 {
@@ -588,6 +599,9 @@ static unsigned int oled_start_i2c(uint8_t *buf)
         0x20, 0,      /* horizontal addressing mode */
         0x21, 0, 127, /* column address range: 0-127 */
         0x22, 0, /*?*//* page address range: 0-? */
+    }, ztech_addr_cmds[] = {
+        0xda, 0x12,   /* alternate com pins config */
+        0x21, 4, 131, /* column address range: 4-131 */
     }, sh1106_addr_cmds[] = {
         0x10          /* column address high nibble is zero */
     };
@@ -600,8 +614,8 @@ static unsigned int oled_start_i2c(uint8_t *buf)
         p += oled_queue_cmds(p, sh1106_addr_cmds, sizeof(sh1106_addr_cmds));
         /* Column address: 0 or 2 (seems 128x64 displays are shifted by 2). */
         *dc++ = (oled_height == 64) ? 0x02 : 0x00;
-        /* Page address: according to oled_row. */
-        *dc++ = 0xb0 + oled_row;
+        /* Page address: according to i2c_row. */
+        *dc++ = 0xb0 + i2c_row;
     } else {
         p += oled_queue_cmds(p, ssd1306_addr_cmds, sizeof(ssd1306_addr_cmds));
         /* Page address max: depends on display height */
@@ -613,6 +627,11 @@ static unsigned int oled_start_i2c(uint8_t *buf)
 
     p += oled_queue_cmds(p, dynamic_cmds, dc - dynamic_cmds);
 
+    /* ZHONGJY_TECH 2.23" 128x32 display based on SSD1305 controller. 
+     * It has alternate COM pin mapping and is offset horizontally. */
+    if (ff_cfg.display_type & DISPLAY_ztech)
+        p += oled_queue_cmds(p, ztech_addr_cmds, sizeof(ztech_addr_cmds));
+
     /* All subsequent bytes are data bytes. */
     *p++ = 0x40;
 
@@ -623,12 +642,42 @@ static unsigned int oled_start_i2c(uint8_t *buf)
     return p - buf;
 }
 
+static int oled_to_lcd_row(int in_row)
+{
+    uint16_t order;
+    int i = 0, row;
+    bool_t large = FALSE;
+
+    order = (ff_cfg.display_order != DORD_default) ? ff_cfg.display_order
+        : (oled_height == 32) ? 0x7710 : menu_mode ? 0x7903 : 0x7183;
+
+    for (;;) {
+        large = !!(order & DORD_double);
+        i += large ? 2 : 1;
+        if (i > in_row)
+            break;
+        order >>= DORD_shift;
+    }
+
+    /* Remap the row */
+    row = order & DORD_row;
+    if (row < lcd_rows) {
+        oled_convert_text_row(text[row]);
+    } else {
+        memset(buffer, 0, 256);
+    }
+
+    return large ? i - in_row : 0;
+}
+
 static unsigned int ssd1306_prep_buffer(void)
 {
+    int size;
+
     /* If we have completed a complete fill of the OLED display, start a new 
      * I2C transaction. The OLED display seems to occasionally silently lose 
      * a byte and then we lose sync with the display address. */
-    if (oled_row == (oled_height / 16)) {
+    if (i2c_row == (oled_height / 16)) {
         /* Wait for BTF. */
         while (!(i2c->sr1 & I2C_SR1_BTF)) {
             /* Any errors: bail and leave it to the Error ISR. */
@@ -638,36 +687,33 @@ static unsigned int ssd1306_prep_buffer(void)
         /* Send STOP. Clears SR1_TXE and SR1_BTF. */
         i2c_stop();
         /* Kick off new I2C transaction. */
-        oled_row = 0;
+        i2c_row = 0;
         refresh_count++;
         return oled_start_i2c(buffer);
     }
 
     /* Convert one row of text[] into buffer[] writes. */
-    if (oled_height == 64) {
-        oled_convert_text_row(text[oled_row/2]);
-        oled_double_height(buffer, &buffer[(oled_row & 1) ? 128 : 0], 0x3);
-    } else {
-        oled_convert_text_row(text[oled_row]);
-    }
+    size = oled_to_lcd_row(i2c_row);
+    if (size != 0)
+        oled_double_height(buffer, &buffer[(size == 1) ? 128 : 0], 0x3);
 
-    oled_row++;
+    i2c_row++;
 
     return 256;
 }
 
 static unsigned int sh1106_prep_buffer(void)
 {
+    int size;
     uint8_t *p = buffer;
 
     /* Convert one row of text[] into buffer[] writes. */
-    if (oled_height == 64) {
-        oled_convert_text_row(text[oled_row/4]);
-        oled_double_height(&buffer[128], &buffer[(oled_row & 2) ? 128 : 0],
-                           (oled_row & 1) + 1);
+    size = oled_to_lcd_row(i2c_row/2);
+    if (size != 0) {
+        oled_double_height(&buffer[128], &buffer[(size == 1) ? 128 : 0],
+                           (i2c_row & 1) + 1);
     } else {
-        oled_convert_text_row(text[oled_row/2]);
-        if (!(oled_row & 1))
+        if (!(i2c_row & 1))
             memcpy(&buffer[128], &buffer[0], 128);
     }
 
@@ -687,8 +733,8 @@ static unsigned int sh1106_prep_buffer(void)
     memcpy(p, &buffer[128], 128);
     p += 128;
 
-    if (++oled_row == (oled_height / 8)) {
-        oled_row = 0;
+    if (++i2c_row == (oled_height / 8)) {
+        i2c_row = 0;
         refresh_count++;
     }
 
@@ -804,7 +850,6 @@ static void oled_init(void)
     p += oled_queue_cmds(p, cmds, sizeof(rot_cmds));
 
     /* Start off the I2C transaction. */
-    oled_row = 0;
     p += oled_start_i2c(p);
 
     /* Send the initialisation command sequence by DMA. */

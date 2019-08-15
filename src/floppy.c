@@ -16,7 +16,9 @@
 #define m(bitnr) (1u<<(bitnr))
 
 /* A soft IRQ for handling lower priority work items. */
+static void chgrst_timer(void *_drv);
 static void drive_step_timer(void *_drv);
+static void motor_spinup_timer(void *_drv);
 void IRQ_43(void) __attribute__((alias("IRQ_soft")));
 #define FLOPPY_SOFTIRQ 43
 
@@ -62,6 +64,13 @@ static struct drive {
     bool_t sel;
     bool_t index_suppressed; /* disable IDX while writing to USB stick */
     uint8_t outp;
+    volatile bool_t inserted;
+    struct timer chgrst_timer;
+    struct {
+        struct timer timer;
+        bool_t on;
+        bool_t changed;
+    } motor;
     struct {
 #define STEP_started  1 /* started by hi-pri IRQ */
 #define STEP_latched  2 /* latched by lo-pri IRQ */
@@ -87,7 +96,8 @@ static struct {
 static void index_assert(void *);   /* index.timer */
 static void index_deassert(void *); /* index.timer_deassert */
 
-static uint32_t max_read_us;
+static time_t prefetch_start_time;
+static uint32_t max_prefetch_us;
 
 static void rdata_stop(void);
 static void wdata_start(void);
@@ -222,7 +232,6 @@ void floppy_cancel(void)
 
     /* Immediately change outputs that we control entirely from the main loop. 
      * Asserting WRPROT prevents any further calls to wdata_start(). */
-    drive_change_output(drv, outp_rdy, FALSE);
     drive_change_output(drv, outp_wrprot, TRUE);
     drive_change_output(drv, outp_hden, FALSE);
     update_amiga_id(FALSE);
@@ -236,16 +245,18 @@ void floppy_cancel(void)
     dma_wdata.ccr = 0;
 
     /* Clear soft state. */
+    timer_cancel(&drv->chgrst_timer);
     timer_cancel(&index.timer);
     barrier(); /* cancel index.timer /then/ clear soft state */
     drv->index_suppressed = FALSE;
     drv->image = NULL;
-    max_read_us = 0;
+    drv->inserted = FALSE;
     image = NULL;
     dma_rd = dma_wr = NULL;
     index.fake_fired = FALSE;
     barrier(); /* clear soft state /then/ cancel index.timer_deassert */
     timer_cancel(&index.timer_deassert);
+    motor_chgrst_eject(drv);
 
     /* Set outputs for empty drive. */
     barrier();
@@ -335,6 +346,8 @@ void floppy_init(void)
     board_floppy_init();
 
     timer_init(&drv->step.timer, drive_step_timer, drv);
+    timer_init(&drv->motor.timer, motor_spinup_timer, drv);
+    timer_init(&drv->chgrst_timer, chgrst_timer, drv);
 
     gpio_configure_pin(gpio_out, pin_02, GPO_bus);
     gpio_configure_pin(gpio_out, pin_08, GPO_bus);
@@ -375,60 +388,108 @@ void floppy_init(void)
 
     timer_init(&index.timer, index_assert, NULL);
     timer_init(&index.timer_deassert, index_deassert, NULL);
+
+    motor_chgrst_eject(drv);
 }
 
 void floppy_insert(unsigned int unit, struct slot *slot)
 {
+    struct image *im;
+    struct dma_ring *_dma_rd, *_dma_wr;
     struct drive *drv = &drive;
+    FSIZE_t fastseek_sz;
+    DWORD *cltbl;
+    FRESULT fr;
 
-    arena_init();
+    do {
 
-    dma_rd = dma_ring_alloc();
-    dma_wr = dma_ring_alloc();
+        arena_init();
 
-    image = arena_alloc(sizeof(*image));
-    memset(image, 0, sizeof(*image));
+        _dma_rd = dma_ring_alloc();
+        _dma_wr = dma_ring_alloc();
 
-    /* Large buffer to absorb long write latencies at mass-storage layer. */
-    image->bufs.write_bc.len = 16*1024; /* 16kB, power of two. */
-    image->bufs.write_bc.p = arena_alloc(image->bufs.write_bc.len);
+        im = arena_alloc(sizeof(*im));
+        memset(im, 0, sizeof(*im));
 
-    /* ~0 avoids sync match within fewer than 32 bits of scan start. */
-    image->write_bc_window = ~0;
+        /* Create a fast-seek cluster table for the image. */
+#define MAX_FILE_FRAGS 511 /* up to a 4kB cluster table */
+        cltbl = arena_alloc(0);
+        *cltbl = (MAX_FILE_FRAGS + 1) * 2;
+        fatfs_from_slot(&im->fp, slot, FA_READ);
+        fastseek_sz = f_size(&im->fp);
+        im->fp.cltbl = cltbl;
+        fr = f_lseek(&im->fp, CREATE_LINKMAP);
+        printk("Fast Seek: %u frags\n", (*cltbl / 2) - 1);
+        if (fr == FR_OK) {
+            DWORD *_cltbl = arena_alloc(*cltbl * 4);
+            ASSERT(_cltbl == cltbl);
+        } else if (fr == FR_NOT_ENOUGH_CORE) {
+            printk("Fast Seek: FAILED\n");
+            cltbl = NULL;
+        } else {
+            F_die(fr);
+        }
 
-    /* Smaller buffer for absorbing read latencies at mass-storage layer. */
-    image->bufs.read_bc.len = 8*1024; /* 8kB, power of two. */
-    image->bufs.read_bc.p = arena_alloc(image->bufs.read_bc.len);
+        /* ~0 avoids sync match within fewer than 32 bits of scan start. */
+        im->write_bc_window = ~0;
 
-    /* Any remaining space is used for staging I/O to mass storage, shared
-     * between read and write paths (Change of use of this memory space is
-     * fully serialised). */
-    image->bufs.write_data.len = arena_avail();
-    image->bufs.write_data.p = arena_alloc(image->bufs.write_data.len);
-    image->bufs.read_data = image->bufs.write_data;
+        /* Large buffer to absorb write latencies at mass-storage layer. */
+        im->bufs.write_bc.len = 32*1024; /* 32kB, power of two. */
+        im->bufs.write_bc.p = arena_alloc(im->bufs.write_bc.len);
 
-    /* Minimum allowable buffer space (assumed by hfe image handler). */
-    ASSERT(image->bufs.read_data.len >= 20*1024);
+        /* Read BC buffer overlaps the second half of the write BC buffer. This 
+         * is because:
+         *  (a) The read BC buffer does not need to absorb such large latencies
+         *      (reads are much more predictable than writes to mass storage).
+         *  (b) By dedicating the first half of the write buffer to writes, we
+         *      can safely start processing write flux while read-data is still
+         *      processing (eg. in-flight mass storage io). At say 10kB of
+         *      dedicated write buffer, this is good for >80ms before colliding
+         *      with read buffers, even at HD data rate (1us/bitcell).
+         *      This is more than enough time for read
+         *      processing to complete. */
+        im->bufs.read_bc.len = im->bufs.write_bc.len / 2;
+        im->bufs.read_bc.p = (char *)im->bufs.write_bc.p
+            + im->bufs.read_bc.len;
 
-    /* Mount the image file. */
-    image_open(image, slot);
-    drv->image = image;
-    if (!image->handler->write_track || volume_readonly())
-        slot->attributes |= AM_RDO;
-    if (slot->attributes & AM_RDO) {
-        printk("Image is R/O\n");
-    } else {
-        image_extend(image);
-    }
+        /* Any remaining space is used for staging I/O to mass storage, shared
+         * between read and write paths (Change of use of this memory space is
+         * fully serialised). */
+        im->bufs.write_data.len = arena_avail();
+        im->bufs.write_data.p = arena_alloc(im->bufs.write_data.len);
+        im->bufs.read_data = im->bufs.write_data;
+
+        /* Minimum allowable buffer space. */
+        ASSERT(im->bufs.read_data.len >= 10*1024);
+
+        /* Mount the image file. */
+        image_open(im, slot, cltbl);
+        if (!im->handler->write_track || volume_readonly())
+            slot->attributes |= AM_RDO;
+        if (slot->attributes & AM_RDO) {
+            printk("Image is R/O\n");
+        } else {
+            image_extend(im);
+        }
+
+    } while (f_size(&im->fp) != fastseek_sz);
 
     /* After image is extended at mount time, we permit no further changes 
      * to the file metadata. Clear the dirent info to ensure this. */
-    image->fp.dir_ptr = NULL;
-    image->fp.dir_sect = 0;
+    im->fp.dir_ptr = NULL;
+    im->fp.dir_sect = 0;
 
-    dma_rd->state = DMA_stopping;
+    _dma_rd->state = DMA_stopping;
 
-    if (image->write_bc_ticks < sysclk_ns(1500))
+    /* Report only significant prefetch times (> 10ms). */
+    max_prefetch_us = 10000;
+
+    /* Make allocated state globally visible now. */
+    drv->image = image = im;
+    dma_rd = _dma_rd;
+    dma_wr = _dma_wr;
+
+    if (im->write_bc_ticks < sysclk_ns(1500))
         drive_change_output(drv, outp_hden, TRUE);
 
     drv->index_suppressed = FALSE;
@@ -498,10 +559,14 @@ void floppy_insert(unsigned int unit, struct slot *slot)
                      DMA_CCR_EN);
 
     /* Drive is ready. Set output signals appropriately. */
-    drive_change_output(drv, outp_rdy, TRUE);
-    update_amiga_id(image->stk_per_rev > stk_ms(300));
+    update_amiga_id(im->stk_per_rev > stk_ms(300));
     if (!(slot->attributes & AM_RDO))
         drive_change_output(drv, outp_wrprot, FALSE);
+    barrier();
+    drv->inserted = TRUE;
+    motor_chgrst_insert(drv); /* update RDY + motor state */
+    if (ff_cfg.chgrst <= CHGRST_delay(15))
+        timer_set(&drv->chgrst_timer, time_now() + ff_cfg.chgrst*time_ms(500));
 }
 
 static unsigned int drive_calc_track(struct drive *drv)
@@ -585,9 +650,9 @@ static void wdata_start(void)
     dma_wr->state = DMA_starting;
 
     /* Start timer. */
-    tim_wdata->ccer = TIM_CCER_CC1E | TIM_CCER_CC1P;
     tim_wdata->egr = TIM_EGR_UG;
     tim_wdata->sr = 0; /* dummy write, gives h/w time to process EGR.UG=1 */
+    tim_wdata->ccer = TIM_CCER_CC1E | TIM_CCER_CC1P;
     tim_wdata->cr1 = TIM_CR1_CEN;
 
     /* Find rotational start position of the write, in SYSCLK ticks. */
@@ -665,8 +730,12 @@ static void floppy_sync_flux(void)
 {
     const uint16_t buf_mask = ARRAY_SIZE(dma_rd->buf) - 1;
     struct drive *drv = &drive;
+    uint32_t prefetch_us;
     uint16_t nr_to_wrap, nr_to_cons, nr;
     int32_t ticks;
+
+    /* No DMA should occur until the timer is enabled. */
+    ASSERT(dma_rd->cons == (ARRAY_SIZE(dma_rd->buf) - dma_rdata.cndtr));
 
     nr_to_wrap = ARRAY_SIZE(dma_rd->buf) - dma_rd->prod;
     nr_to_cons = (dma_rd->cons - dma_rd->prod - 1) & buf_mask;
@@ -680,6 +749,13 @@ static void floppy_sync_flux(void)
     nr = (dma_rd->prod - dma_rd->cons) & buf_mask;
     if (nr < buf_mask)
         return;
+
+    /* Log maximum prefetch times. */
+    prefetch_us = time_diff(prefetch_start_time, time_now()) / TIME_MHZ;
+    if (prefetch_us > max_prefetch_us) {
+        max_prefetch_us = prefetch_us;
+        printk("[%uus]\n", max_prefetch_us);
+    }
 
     if (!drv->index_suppressed) {
         ticks = time_diff(time_now(), sync_time) - time_us(1);
@@ -715,9 +791,34 @@ static void floppy_sync_flux(void)
     }
 
     if (drv->index_suppressed) {
-        /* Re-enable index timing, snapped to the new read stream. */
+
+        /* Re-enable index timing, snapped to the new read stream. 
+         * Disable low-priority IRQs to keep timings tight. */
+        uint32_t oldpri = IRQ_save(TIMER_IRQ_PRI);
+
         timer_cancel(&index.timer);
+
+        /* If we crossed the index mark while filling the DMA buffer then we
+         * need to set up the index pulse (usually done by IRQ_rdata_dma). */
+        if (image_ticks_since_index(drv->image)
+            < (sync_pos*(SYSCLK_MHZ/STK_MHZ))) {
+
+            /* Sum all flux timings in the DMA buffer. */
+            const uint16_t buf_mask = ARRAY_SIZE(dma_rd->buf) - 1;
+            uint32_t i, ticks = 0;
+            for (i = dma_rd->cons; i != dma_rd->prod; i = (i+1) & buf_mask)
+                ticks += dma_rd->buf[i] + 1;
+
+            /* Subtract current flux offset beyond the index. */
+            ticks -= image_ticks_since_index(drv->image);
+
+            /* Calculate deadline for index timer. */
+            ticks /= SYSCLK_MHZ/TIME_MHZ;
+            timer_set(&index.timer, time_now() + ticks);
+        }
+
         IRQ_global_disable();
+        IRQ_restore(oldpri);
         index.prev_time = time_now() - sync_pos;
         drv->index_suppressed = FALSE;
     }
@@ -727,22 +828,11 @@ static void floppy_sync_flux(void)
 
 static void floppy_read_data(struct drive *drv)
 {
-    uint32_t read_us;
-    time_t timestamp;
-
     /* Read some track data if there is buffer space. */
-    timestamp = time_now();
     if (image_read_track(drv->image) && dma_rd->kick_dma_irq) {
         /* We buffered some more data and the DMA handler requested a kick. */
         dma_rd->kick_dma_irq = FALSE;
         IRQx_set_pending(dma_rdata_irq);
-    }
-
-    /* Log maximum time taken to read track data, in microseconds. */
-    read_us = time_diff(timestamp, time_now()) / TIME_MHZ;
-    if (read_us > max_read_us) {
-        max_read_us = max_t(uint32_t, max_read_us, read_us);
-        printk("New max: read_us=%u\n", max_read_us);
     }
 }
 
@@ -782,6 +872,7 @@ static bool_t dma_rd_handle(struct drive *drv)
         }
         if (image_setup_track(drv->image, track, &read_start_pos))
             return TRUE;
+        prefetch_start_time = time_now();
         read_start_pos /= SYSCLK_MHZ/STK_MHZ;
         sync_pos = read_start_pos;
         if (!drv->index_suppressed) {
@@ -865,11 +956,15 @@ static bool_t dma_wr_handle(struct drive *drv)
         /* Sync back to mass storage. */
         F_sync(&im->fp);
 
-        /* Consume the write from the pipeline buffer. If the buffer is 
-         * empty then return to read operation. */
         IRQ_global_disable();
-        if ((++im->wr_cons == im->wr_prod) && (dma_wr->state != DMA_starting))
+        /* Consume the write from the pipeline buffer. */
+        im->wr_cons++;
+        /* If the buffer is empty then reset the write-bitcell ring and return 
+         * to read operation. */
+        if ((im->wr_cons == im->wr_prod) && (dma_wr->state != DMA_starting)) {
+            im->bufs.write_bc.cons = im->bufs.write_bc.prod = 0;
             dma_wr->state = DMA_inactive;
+        }
         IRQ_global_enable();
 
         /* This particular write is completed. */
@@ -910,7 +1005,8 @@ static void index_assert(void *dat)
     struct drive *drv = &drive;
     index.prev_time = index.timer.deadline;
     if (!drv->index_suppressed
-        && !(drv->step.state && ff_cfg.index_suppression)) {
+        && !(drv->step.state && ff_cfg.index_suppression)
+        && drv->motor.on) {
         drive_change_output(drv, outp_index, TRUE);
         timer_set(&index.timer_deassert, index.prev_time + time_ms(2));
     }
@@ -922,6 +1018,12 @@ static void index_deassert(void *dat)
 {
     struct drive *drv = &drive;
     drive_change_output(drv, outp_index, FALSE);
+}
+
+static void chgrst_timer(void *_drv)
+{
+    struct drive *drv = _drv;
+    drive_change_output(drv, outp_dskchg, FALSE);
 }
 
 static void drive_step_timer(void *_drv)
@@ -950,6 +1052,14 @@ static void drive_step_timer(void *_drv)
         cmpxchg(&drv->step.state, STEP_settling, 0);
         break;
     }
+}
+
+static void motor_spinup_timer(void *_drv)
+{
+    struct drive *drv = _drv;
+
+    drv->motor.on = TRUE;
+    drive_change_output(drv, outp_rdy, TRUE);
 }
 
 static void IRQ_soft(void)

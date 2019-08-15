@@ -55,14 +55,15 @@ static void da_seek_track(struct image *im, uint16_t track)
         return;
     im->cur_track = track;
 
+    volume_cache_init(im->bufs.write_data.p + SEC_SZ + 2,
+                      im->bufs.write_data.p + im->bufs.write_data.len);
+
     switch (display_mode) {
     case DM_LED_7SEG:
         led_7seg_write_string((led_7seg_nr_digits() == 3) ? "D-A" : "DA");
         break;
-    case DM_LCD_1602:
-        lcd_clear();
-        lcd_write((lcd_columns-11)/2, 0, 0, "Host Direct");
-        lcd_write((lcd_columns- 6)/2, 1, 0, "Access");
+    case DM_LCD_OLED:
+        lcd_write(0, 0, -1, "*Direct Access*");
         break;
     }
 
@@ -270,7 +271,7 @@ static bool_t mfm_read_track(struct image *im)
     uint8_t *buf = rd->p;
     uint16_t *bc_b = bc->p;
     uint32_t bc_len, bc_mask, bc_space, bc_p, bc_c;
-    uint16_t pr = 0, crc;
+    uint16_t pr, crc;
     unsigned int i;
 
     /* Generate some MFM if there is space in the raw-bitcell ring buffer. */
@@ -282,6 +283,7 @@ static bool_t mfm_read_track(struct image *im)
     if (bc_space < im->da.dam_sz)
         return FALSE;
 
+    pr = be16toh(bc_b[(bc_p-1) & bc_mask]);
 #define emit_raw(r) ({                                   \
     uint16_t _r = (r);                                   \
     bc_b[bc_p++ & bc_mask] = htobe16(_r & ~(pr << 15));  \
@@ -360,7 +362,7 @@ static bool_t fm_write_track(struct image *im)
     uint8_t *wrbuf = im->bufs.write_data.p;
     uint32_t c = wr->cons / 16, p = wr->prod / 16;
     uint32_t base = write->start / im->ticks_per_cell; /* in data bytes */
-    unsigned int sect, i;
+    unsigned int sect;
     uint16_t sync;
     uint8_t x;
 
@@ -386,8 +388,8 @@ static bool_t fm_write_track(struct image *im)
         sect = (base - im->da.idx_sz - im->da.idam_sz + enc_sec_sz(im)/2)
             / enc_sec_sz(im);
 
-        for (i = 0; i < (SEC_SZ + 2); i++)
-            wrbuf[i] = mfmtobin(buf[c++ & bufmask]);
+        mfm_ring_to_bin(buf, bufmask, c, wrbuf, SEC_SZ + 2);
+        c += SEC_SZ + 2;
 
         process_wdata(im, sect, crc16_ccitt(&x, 1, 0xffff));
     }
@@ -456,8 +458,8 @@ static bool_t mfm_write_track(struct image *im)
             break;
         }
 
-        for (i = 0; i < (SEC_SZ + 2); i++)
-            wrbuf[i] = mfmtobin(buf[c++ & bufmask]);
+        mfm_ring_to_bin(buf, bufmask, c, wrbuf, SEC_SZ + 2);
+        c += SEC_SZ + 2;
 
         process_wdata(im, sect, crc);
     }
@@ -520,16 +522,11 @@ static void process_wdata(struct image *im, unsigned int sect, uint16_t crc)
             break;
         }
         case CMD_SELECT_NAME: {
-            int index;
             char *name = (char *)dac->param;
             name[FF_MAX_LFN] = '\0';
-            index = set_slot_by_name(name, wrbuf + 512);
-            printk("D-A Img By Name \"%s\" %u -> %d\n",
-                   name, dass->current_index, index);
-            if (index >= 0) {
-                dass->current_index = index;
-                dass->last_cmd_status = 0;
-            }
+            set_slot_name(name);
+            printk("D-A Img By Name \"%s\"\n", name);
+            dass->last_cmd_status = 0;
             break;
         }
         default:

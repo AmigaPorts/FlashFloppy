@@ -24,6 +24,8 @@
 #define outp_nr     6
 #define outp_unused outp_nr
 
+#define verbose_image_log FALSE
+
 struct adf_image {
     uint32_t trk_off;
     uint16_t trk_pos, trk_len;
@@ -38,6 +40,10 @@ struct hfe_image {
     uint16_t trk_pos, trk_len;
     bool_t is_v3;
     uint8_t batch_secs;
+    struct {
+        uint16_t start;
+        bool_t wrapped;
+    } write;
     struct {
         uint16_t off, len;
         bool_t dirty;
@@ -78,6 +84,7 @@ struct img_image {
     uint16_t gap_4;
     uint32_t idx_sz, idam_sz;
     uint16_t dam_sz_pre, dam_sz_post;
+    void *heap_bottom;
 };
 
 struct dsk_image {
@@ -158,7 +165,7 @@ struct image {
         struct directaccess da;
     };
 
-    const struct slot *slot;
+    struct slot *slot;
 };
 
 static inline struct write *get_write(struct image *im, uint16_t idx)
@@ -168,7 +175,7 @@ static inline struct write *get_write(struct image *im, uint16_t idx)
 
 struct image_handler {
     bool_t (*open)(struct image *im);
-    void (*extend)(struct image *im);
+    FSIZE_t (*extend)(struct image *im);
     void (*setup_track)(
         struct image *im, uint16_t track, uint32_t *start_pos);
     bool_t (*read_track)(struct image *im);
@@ -186,7 +193,7 @@ extern const struct image_type {
 bool_t image_valid(FILINFO *fp);
 
 /* Open specified image file on mass storage device. */
-void image_open(struct image *im, const struct slot *slot);
+void image_open(struct image *im, struct slot *slot, DWORD *cltbl);
 
 /* Extend a trunated image file. */
 void image_extend(struct image *im);
@@ -219,6 +226,9 @@ uint32_t image_ticks_since_index(struct image *im);
 extern const uint16_t mfmtab[];
 static inline uint16_t bintomfm(uint8_t x) { return mfmtab[x]; }
 uint8_t mfmtobin(uint16_t x);
+void mfm_to_bin(const void *in, void *out, unsigned int nr);
+void mfm_ring_to_bin(const uint16_t *ring, unsigned int mask,
+                     unsigned int idx, void *out, unsigned int nr);
 
 /* FM conversion. */
 #define FM_SYNC_CLK 0xc7

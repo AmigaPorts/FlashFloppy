@@ -13,8 +13,11 @@ SECTIONS
   .text : {
     _stext = .;
     *(.vector_table)
+    *(.vector_table*)
+    _smaintext = .;
     *(.text)
     *(.text*)
+    _emaintext = .;
     *(.rodata)
     *(.rodata*)
     KEEP (*(.init))

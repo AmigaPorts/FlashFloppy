@@ -13,14 +13,15 @@
 #define O_TRUE  0
 
 /* Input pins: DIR=PB0, STEP=PA1, SELA=PA0, SELB=PA3, WGATE=PB9, SIDE=PB4, 
- *             MOTOR=PA15 */
+ *             MOTOR=PA15/PB15 */
 #define pin_dir     0 /* PB0 */
 #define pin_step    1 /* PA1 */
 #define pin_sel0    0 /* PA0 */
 #define pin_sel1    3 /* PA3 */
 #define pin_wgate   9 /* PB9 */
 #define pin_side    4 /* PB4 */
-#define pin_motor  15 /* PA15 */
+#define pin_motor  15 /* PA15 or PB15 */
+#define pin_chgrst 14 /* PA14 if CHGRST_pa14 */
 
 /* Output pins. */
 #define gpio_out gpiob
@@ -51,11 +52,14 @@ void IRQ_13(void) __attribute__((alias("IRQ_rdata_dma")));
 void IRQ_7(void) __attribute__((alias("IRQ_STEP_changed"))); /* EXTI1 */
 void IRQ_10(void) __attribute__((alias("IRQ_SIDE_changed"))); /* EXTI4 */
 void IRQ_23(void) __attribute__((alias("IRQ_WGATE_changed"))); /* EXTI9_5 */
+void IRQ_40(void) __attribute__((alias("IRQ_MOTOR_CHGRST"))); /* EXTI15_10 */
+#define MOTOR_CHGRST_IRQ 40
 static const struct exti_irq exti_irqs[] = {
-    {  6, FLOPPY_IRQ_SEL_PRI, 0 }, 
-    {  7, FLOPPY_IRQ_STEP_PRI, m(pin_step) },
-    { 10, FLOPPY_IRQ_SIDE_PRI, 0 }, 
-    { 23, FLOPPY_IRQ_WGATE_PRI, 0 } 
+    /* SELA */ {  6, FLOPPY_IRQ_SEL_PRI, 0 }, 
+    /* STEP */ {  7, FLOPPY_IRQ_STEP_PRI, m(pin_step) },
+    /* SIDE */ { 10, TIMER_IRQ_PRI, 0 }, 
+    /* WGATE */ { 23, FLOPPY_IRQ_WGATE_PRI, 0 },
+    /* MTR/CHGRST */ { 40, TIMER_IRQ_PRI, 0 }
 };
 
 bool_t floppy_ribbon_is_reversed(void)
@@ -77,22 +81,35 @@ bool_t floppy_ribbon_is_reversed(void)
 
 static void board_floppy_init(void)
 {
+    uint32_t pins;
+
     gpio_configure_pin(gpiob, pin_dir,   GPI_bus);
     gpio_configure_pin(gpioa, pin_step,  GPI_bus);
     gpio_configure_pin(gpioa, pin_sel0,  GPI_bus);
     gpio_configure_pin(gpiob, pin_wgate, GPI_bus);
     gpio_configure_pin(gpiob, pin_side,  GPI_bus);
+
+    /* PA[15:14] -> EXT[15:14], PB[13:2] -> EXT[13:2], PA[1:0] -> EXT[1:0] */
+    afio->exticr4 = 0x0011;
+    afio->exticr2 = 0x1111;
+    afio->exticr3 = 0x1111;
+    afio->exticr1 = 0x1100;
+
     if (gotek_enhanced()) {
         gpio_configure_pin(gpioa, pin_sel1,  GPI_bus);
         gpio_configure_pin(gpioa, pin_motor, GPI_bus);
+    } else {
+        /* This gives us "motor always on" if the pin is not connected. 
+         * It is safe enough to pull down even if connected direct to 5v, 
+         * will only sink ~0.15mA via the weak internal pulldown. */
+        gpio_configure_pin(gpiob, pin_motor, GPI_pull_down);
+        afio->exticr4 = 0x1011; /* Motor = PB15 */
     }
 
-    /* PB[15:2] -> EXT[15:2], PA[1:0] -> EXT[1:0] */
-    afio->exticr2 = afio->exticr3 = afio->exticr4 = 0x1111;
-    afio->exticr1 = 0x1100;
-
-    exti->imr = exti->rtsr = exti->ftsr =
-        m(pin_wgate) | m(pin_side) | m(pin_step) | m(pin_sel0);
+    pins = m(pin_wgate) | m(pin_side) | m(pin_sel0);
+    exti->rtsr = pins | m(pin_motor) | m(pin_step);
+    exti->ftsr = pins | m(pin_motor) | m(pin_chgrst);
+    exti->imr = pins | m(pin_step);
 }
 
 /* Fast speculative entry point for SELA-changed IRQ. We assume SELA has 
@@ -219,23 +236,24 @@ static void IRQ_STEP_changed(void)
     struct drive *drv = &drive;
     uint8_t idr_a, idr_b;
 
-    /* Clear STEP-changed flag. */
-    exti->pr = m(pin_step);
-
     /* Latch inputs. */
     idr_a = gpioa->idr;
     idr_b = gpiob->idr;
+
+    /* Clear STEP-changed flag. */
+    exti->pr = m(pin_step);
 
     /* Bail if drive not selected. */
     if (idr_a & m(pin_sel0))
         return;
 
-    /* DSKCHG asserts on any falling edge of STEP. We deassert on any edge. */
-    if ((drv->outp & m(outp_dskchg)) && (dma_rd != NULL))
+    /* Deassert DSKCHG if a disk is inserted. */
+    if ((drv->outp & m(outp_dskchg)) && drv->inserted
+        && (ff_cfg.chgrst == CHGRST_step))
         drive_change_output(drv, outp_dskchg, FALSE);
 
-    if (!(idr_a & m(pin_step))   /* Not rising edge on STEP? */
-        || (drv->step.state & STEP_active) /* Already mid-step? */
+    /* Do we accept this STEP command? */
+    if ((drv->step.state & STEP_active) /* Already mid-step? */
         || drive_is_writing())   /* Write in progress? */
         return;
 
@@ -304,6 +322,82 @@ static void IRQ_WGATE_changed(void)
         rdata_stop();
         wdata_start();
     }
+}
+
+static void IRQ_MOTOR(struct drive *drv)
+{
+    GPIO gpio = gotek_enhanced() ? gpioa : gpiob;
+
+    timer_cancel(&drv->motor.timer);
+    drv->motor.on = FALSE;
+
+    if (!drv->inserted) {
+        /* No disk inserted -- MOTOR OFF */
+        drive_change_output(drv, outp_rdy, FALSE);
+    } else if (ff_cfg.motor_delay == MOTOR_ignore) {
+        /* Motor signal ignored -- MOTOR ON */
+        drv->motor.on = TRUE;
+        drive_change_output(drv, outp_rdy, TRUE);
+    } else if (gpio->idr & m(pin_motor)) {
+        /* Motor signal off -- MOTOR OFF */
+        drive_change_output(drv, outp_rdy, FALSE);
+    } else {
+        /* Motor signal on -- MOTOR SPINNING UP */
+        timer_set(&drv->motor.timer,
+                  time_now() + time_ms(ff_cfg.motor_delay * 10));
+    }
+}
+
+static void IRQ_CHGRST(struct drive *drv)
+{
+    if ((ff_cfg.chgrst == CHGRST_pa14)
+        && (gpio_read_pin(gpioa, pin_chgrst) == O_TRUE)
+        && drv->inserted) {
+        drive_change_output(drv, outp_dskchg, FALSE);
+    }
+}
+
+static void IRQ_MOTOR_CHGRST(void)
+{
+    struct drive *drv = &drive;
+    bool_t changed = drv->motor.changed;
+    uint32_t pr = exti->pr;
+
+    drv->motor.changed = FALSE;
+    exti->pr = m(pin_motor) | m(pin_chgrst);
+
+    if ((pr & m(pin_motor)) || changed)
+        IRQ_MOTOR(drv);
+
+    if ((pr & m(pin_chgrst)) || changed)
+        IRQ_CHGRST(drv);
+}
+
+static void motor_chgrst_update_status(struct drive *drv)
+{
+    drv->motor.changed = TRUE;
+    barrier();
+    IRQx_set_pending(MOTOR_CHGRST_IRQ);
+}
+
+static void motor_chgrst_insert(struct drive *drv)
+{
+    uint32_t imr = exti->imr;
+
+    if (ff_cfg.motor_delay != MOTOR_ignore)
+        imr |= m(pin_motor);
+
+    if (ff_cfg.chgrst == CHGRST_pa14)
+        imr |= m(pin_chgrst);
+
+    exti->imr = imr;
+    motor_chgrst_update_status(drv);
+}
+
+static void motor_chgrst_eject(struct drive *drv)
+{
+    exti->imr &= ~(m(pin_motor) | m(pin_chgrst));
+    motor_chgrst_update_status(drv);
 }
 
 /*

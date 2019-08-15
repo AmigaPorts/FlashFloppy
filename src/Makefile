@@ -1,5 +1,6 @@
 OBJS += arena.o
 OBJS += build_info.o
+OBJS += cache.o
 OBJS += cancellation.o
 OBJS += config.o
 OBJS += crc.o
@@ -19,6 +20,7 @@ OBJS += util.o
 OBJS += volume.o
 
 OBJS-$(debug) += console.o
+OBJS-$(logfile) += logfile.o
 
 SUBDIRS += display
 SUBDIRS += fatfs
