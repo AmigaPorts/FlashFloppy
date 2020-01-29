@@ -1,5 +1,5 @@
 
-export FW_VER := 3.3a
+export FW_VER := 3.11a
 
 PROJ := FlashFloppy
 VER := v$(FW_VER)
@@ -29,13 +29,14 @@ gotek: all
 
 HXC_FF_URL := https://www.github.com/keirf/HxC_FF_File_Selector
 HXC_FF_URL := $(HXC_FF_URL)/releases/download
-HXC_FF_VER := v6-FF
+HXC_FF_VER := v8-FF
 
 dist:
 	rm -rf flashfloppy-*
 	mkdir -p flashfloppy-$(VER)/alt/bootloader
 	mkdir -p flashfloppy-$(VER)/alt/logfile
 	mkdir -p flashfloppy-$(VER)/alt/io-test
+	mkdir -p flashfloppy-$(VER)/alt/quickdisk/logfile
 	$(MAKE) clean
 	$(MAKE) gotek
 	cp -a FF_Gotek-$(VER).dfu flashfloppy-$(VER)/
@@ -46,6 +47,13 @@ dist:
 	$(MAKE) clean
 	debug=n logfile=y $(MAKE) -f $(ROOT)/Rules.mk upd
 	mv FF.upd flashfloppy-$(VER)/alt/logfile/FF_Gotek-Logfile-$(VER).upd
+	$(MAKE) clean
+	quickdisk=y $(MAKE) -f $(ROOT)/Rules.mk upd
+	mv FF.upd flashfloppy-$(VER)/alt/quickdisk/FF_Gotek-QuickDisk-$(VER).upd
+	$(MAKE) clean
+	quickdisk=y debug=n logfile=y $(MAKE) -f $(ROOT)/Rules.mk upd
+	mv FF.upd flashfloppy-$(VER)/alt/quickdisk/logfile/FF_Gotek-QuickDisk-Logfile-$(VER).upd
+	python scripts/mk_qd.py --window=6.5 flashfloppy-$(VER)/alt/quickdisk/Blank.qd
 	$(MAKE) clean
 	cp -a COPYING flashfloppy-$(VER)/
 	cp -a README.md flashfloppy-$(VER)/
@@ -73,7 +81,8 @@ upd:
 
 all:
 	$(MAKE) -C src -f $(ROOT)/Rules.mk $(PROJ).elf $(PROJ).bin $(PROJ).hex
-	bootloader=y $(MAKE) -C bootloader -f $(ROOT)/Rules.mk \
+	bootloader=y debug=n logfile=n $(MAKE) -C bootloader \
+		-f $(ROOT)/Rules.mk \
 		Bootloader.elf Bootloader.bin Bootloader.hex
 	logfile=n $(MAKE) -C bl_update -f $(ROOT)/Rules.mk \
 		BL_Update.elf BL_Update.bin BL_Update.hex

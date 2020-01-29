@@ -3,6 +3,60 @@
 ** Keir Fraser <keir.xen@gmail.com>
 ************************************
 
+** v3.11a - 30 December 2019
+ - LCD/OLED: Fix subfolder name, as shown in 3- & 4-row displays
+   - Subfolder wasn't updated correctly when moving to parent (..) folder
+
+** v3.10a - 28 December 2019
+ - Bootloader: Wait for buttons to be pressed then released...
+   - ...before starting firmware update process
+   - Avoids an infinite loop when reprogramming Bootloader itself
+ 
+** v3.9a - 27 December 2019
+ - IMG: Fix density-select pin output for HD images
+   - Fixes 'pin02=dens' and 'interface=ibmpc-hdout'
+   - Bug has existed since v2.2a
+ - Rotary Encoder: Improve tracking
+   - Higher frequency, and better debounce algorithm
+
+** v3.8a - 10 December 2019
+ - USB: Fix buffer overflow when parsing string descriptors
+   - Fixes crash with recent SanDisk Ultra Fit drives
+ - HxC Compat, v8-FF: Fixes startup crash on Atari ST
+ - Amiga: Fixes for "interface = amiga" setting
+ - TR-DOS (TRD): Fix geometry when TR-DOS header is incomplete
+ - Quick Disk: Larger read/write window in default blank image
+ - GCC9 build fixes
+
+** v3.7a - 11 November 2019
+ - Quick Disk Bug Fixes
+   - Fix write offsets and lengths within QD track
+   - Filter ADF images from navigator: only QD images supported
+   - Extra logging in FFLOG.TXT for debug purposes
+ - Amiga AutoSwap new title: Gobliiiins
+   - Thanks to Arkadiusz Makarenko!
+   - https://github.com/keirf/FF_AutoSwap/wiki/Downloads
+
+** v3.6a - 13 October 2019
+ - Quick Disk Initial Release
+   - New firmware and blank QD image in alt/quickdisk
+   - Documentation in the Wiki
+ - Update HxC Compat to v7-FF
+   - Fix failure when booted on unmodded A1200 ESCOM boards
+
+** v3.5a - 9 October 2019
+ - New Main Menu: Press Prev/Next or Select with no Flash drive inserted
+   - Factory Reset, Firmware Update, OSD Config
+ - OSD: Must be updated to latest version: v1.7 or later!
+ - OSD: Receive Gotek button commands via I2C
+ - OSD: Default to 40 columns if no other display is connected
+ - TR-DOS (TRD): Fix geometry detection based on TR-DOS header
+
+** v3.4a - 25 September 2019
+ - FF OSD support
+   - Bus sharing with existing LCD/OLED display
+   - Gotek buttons can be remoted to FF OSD for OSD configuration
+
 ** v3.3a - 8 July 2019
  - FF.CFG: New Disk-Change Reset option: chgrst=delay-N
    - Automatically clears the DSKCHG signal Nx0.5s after disk insertion

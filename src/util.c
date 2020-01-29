@@ -134,7 +134,7 @@ size_t strnlen(const char *s, size_t maxlen)
 
 int strcmp(const char *s1, const char *s2)
 {
-    return strncmp(s1, s2, ~0);
+    return strncmp(s1, s2, INT_MAX);
 }
 
 int strncmp(const char *s1, const char *s2, size_t n)
@@ -309,6 +309,13 @@ uint32_t rand(void)
     x ^= x >> 17;
     x ^= x << 5;
     return x;
+}
+
+unsigned int popcount(uint32_t x)
+{
+    x = x - ((x >> 1) & 0x55555555);
+    x = (x & 0x33333333) + ((x >> 2) & 0x33333333);
+    return (((x + (x >> 4)) & 0x0f0f0f0f) * 0x01010101) >> 24;
 }
 
 /*

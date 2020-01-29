@@ -62,6 +62,8 @@ static struct {
 
 uint8_t board_id;
 
+#define BUTTON_SCAN_HZ 500
+#define BUTTON_SCAN_MS (1000/BUTTON_SCAN_HZ)
 static uint32_t display_ticks;
 static uint8_t display_state;
 enum { BACKLIGHT_OFF, BACKLIGHT_SWITCHING_ON, BACKLIGHT_ON };
@@ -357,7 +359,7 @@ static uint8_t lcd_handle_backlight(uint8_t b)
         /* After a period with no button activity we turn the backlight off. */
         if (b)
             display_ticks = 0;
-        if (display_ticks++ >= 200*ff_cfg.display_off_secs) {
+        if (display_ticks++ >= BUTTON_SCAN_HZ*ff_cfg.display_off_secs) {
             lcd_backlight(FALSE);
             display_state = BACKLIGHT_OFF;
         }
@@ -386,12 +388,62 @@ static uint8_t led_handle_display(uint8_t b)
         break;
     case LED_BUTTON_RELEASED:
         /* After a period with no button activity we return to track number. */
-        if (display_ticks++ >= 200*3)
+        if (display_ticks++ >= BUTTON_SCAN_HZ*3)
             display_state = LED_TRACK;
         break;
     }
 
     return b;
+}
+
+static uint8_t read_rotary(uint8_t rotary)
+{
+    /* Rotary encoder outputs a Gray code, counting clockwise: 00-01-11-10. */
+    const uint32_t rotary_transitions = 0x24428118;
+
+    /* Number of back-to-back transitions we see per detent on various 
+     * types of rotary encoder. */
+    const uint8_t rotary_transitions_per_detent[] = {
+        [ROT_full] = 4, [ROT_half] = 2, [ROT_quarter] = 1
+    };
+
+    /* p_t(x) returns the previous valid transition in same direction. 
+     * eg. p_t(0b0111) == 0b0001 */
+#define p_t(x) (((x)>>2)|((((x)^3)&3)<<2))
+
+    /* Bitmask of which valid 4-bit transition codes we have seen in each 
+     * direction (CW and CCW). */
+    static uint16_t t_seen[2];
+
+    uint16_t ts;
+    uint8_t rb;
+
+    /* Check if we have seen a valid CW or CCW state transition. */
+    rb = (rotary_transitions >> (rotary << 1)) & 3;
+    if (likely(!rb))
+        return 0; /* Nope */
+
+    /* Have we seen the /previous/ transition in this direction? If not, any 
+     * previously-recorded transitions are not in a contiguous step-wise
+     * sequence, and should be discarded as switch bounce. */
+    ts = t_seen[rb-1];
+    if (!(ts & (1<<p_t(rotary))))
+        ts = 0; /* Clear any existing bounce transitions. */
+
+    /* Record this transition and check if we have seen enough to get 
+     * us from one detent to another. */
+    ts |= (1<<rotary);
+    if (popcount(ts) < rotary_transitions_per_detent[ff_cfg.rotary & 3]) {
+        /* Not enough transitions yet: Remember where we are for next time. */
+        t_seen[rb-1] = ts;
+        return 0;
+    }
+
+    /* This is a valid movement between detents. Clear transition state 
+     * and return the movement to the caller. */
+    t_seen[0] = t_seen[1] = 0;
+    return rb;
+#undef pt
 }
 
 static struct timer button_timer;
@@ -402,19 +454,12 @@ static uint8_t rotary;
 #define B_SELECT 4
 static void button_timer_fn(void *unused)
 {
-    /* Rotary encoder outputs a Gray code, counting clockwise: 00-01-11-10. */
-    const uint32_t rotary_transitions[] = {
-        [ROT_none]    = 0x00000000, /* No encoder */
-        [ROT_full]    = 0x20000100, /* 4 transitions (full cycle) per detent */
-        [ROT_half]    = 0x24000018, /* 2 transitions (half cycle) per detent */
-        [ROT_quarter] = 0x24428118  /* 1 transition (quarter cyc) per detent */
-    };
     const uint8_t rotary_reverse[4] = {
         [B_LEFT] = B_RIGHT, [B_RIGHT] = B_LEFT
     };
 
-    static uint16_t _b[3]; /* 0 = left, 1 = right, 2 = select */
-    uint8_t b = 0, rb;
+    static uint32_t _b[3]; /* 0 = left, 1 = right, 2 = select */
+    uint8_t b = osd_buttons_rx, rb;
     bool_t twobutton_rotary =
         (ff_cfg.twobutton_action & TWOBUTTON_mask) == TWOBUTTON_rotary;
     int i, twobutton_reverse = !!(ff_cfg.twobutton_action & TWOBUTTON_reverse);
@@ -427,7 +472,7 @@ static void button_timer_fn(void *unused)
     }
 
     /* We debounce the switches by waiting for them to be pressed continuously 
-     * for 16 consecutive sample periods (16 * 5ms == 80ms) */
+     * for 32 consecutive sample periods (32 * 2ms == 64ms) */
     for (i = 0; i < 3; i++) {
         _b[i] <<= 1;
         _b[i] |= gpio_read_pin(gpioc, 8-i);
@@ -444,22 +489,23 @@ static void button_timer_fn(void *unused)
 
     rotary = ((rotary << 2) | ((gpioc->idr >> 10) & 3)) & 15;
     switch (ff_cfg.rotary & ~ROT_reverse) {
+
     case ROT_trackball: {
-        static uint8_t count, thresh, dir;
+        static uint16_t count, thresh, dir;
         rb = rotary_reverse[(rotary ^ (rotary >> 2)) & 3];
         if (rb == 0) {
             /* Idle: Increase threshold, decay the counter. */
-            if (thresh < 72) thresh++;
-            if (count) count--;
+            thresh = min_t(int, thresh + BUTTON_SCAN_MS, 360);
+            count = max_t(int, count - BUTTON_SCAN_MS, 0);
         } else if (rb != dir) {
             /* Change of direction: Put the brakes on. */
             dir = rb;
             count = rb = 0;
-            thresh = 72;
+            thresh = 360;
         } else {
             /* Step in same direction: Increase count, decay the threshold. */
-            count += 32;
-            thresh = max_t(int, 0, thresh - 8);
+            count += 160;
+            thresh = max_t(int, 0, thresh - 40);
             if (count >= thresh) {
                 /* Count exceeds threshold: register a press. */
                 count = 0;
@@ -470,12 +516,16 @@ static void button_timer_fn(void *unused)
         }
         break;
     }
+
     case ROT_buttons:
         rb = rotary_reverse[rotary & 3];
         break;
-    default: /* rotary encoder */
-        rb = (rotary_transitions[ff_cfg.rotary & 3] >> (rotary << 1)) & 3;
+
+    default: /* rotary encoder */ {
+        rb = read_rotary(rotary);
         break;
+    }
+
     }
     if (ff_cfg.rotary & ROT_reverse)
         rb = rotary_reverse[rb];
@@ -492,7 +542,7 @@ static void button_timer_fn(void *unused)
 
     /* Latch final button state and reset the timer. */
     buttons = b;
-    timer_set(&button_timer, button_timer.deadline + time_ms(5));
+    timer_set(&button_timer, button_timer.deadline + time_ms(BUTTON_SCAN_MS));
 }
 
 static void canary_init(void)
@@ -1421,8 +1471,18 @@ static void native_update(uint8_t slot_mode)
                 if (!p) F_die(FR_BAD_IMAGECFG); /* must exist */
                 *p = '\0';
                 if ((q = strrchr(fs->buf, '/')) != NULL) {
-                    lcd_write(0, 3, -1, q+1);
-                    F_lseek(&fs->file, f_tell(&fs->file) - (p-q));
+                    /* We need to find the next preceding '/' so we can update 
+                     * multi-row LCD/OLED display with subfolder info. */
+                    long sz, pos = f_tell(&fs->file) - (p-q);
+                    /* pos-1 = offset of end of subfolder name. */
+                    sz = min_t(long, pos-1, sizeof(fs->buf));
+                    F_lseek(&fs->file, pos-1-sz);
+                    F_read(&fs->file, fs->buf, sz, NULL);
+                    fs->buf[sz] = '\0';
+                    /* q = pointer to '/' preceding the subfolder name. */
+                    q = strrchr(fs->buf, '/');
+                    lcd_write(0, 3, -1, q ? q+1 : fs->buf);
+                    F_lseek(&fs->file, pos);
                 } else {
                     F_lseek(&fs->file, 0);
                     lcd_write(0, 3, -1, "/");
@@ -1900,6 +1960,22 @@ static void noinline volume_space(void)
 
 }
 
+/* Wait 50ms for 2-button press. */
+static uint8_t wait_twobutton_press(uint8_t b)
+{
+    unsigned int wait;
+
+    for (wait = 0; wait < 50; wait++) {
+        if ((buttons & (B_LEFT|B_RIGHT)) == (B_LEFT|B_RIGHT))
+            b = B_SELECT;
+        if (b & B_SELECT)
+            break;
+        delay_ms(1);
+    }
+
+    return b;
+}
+
 static uint8_t menu_wait_button(bool_t twobutton_eject, const char *led_msg)
 {
     unsigned int wait = 0;
@@ -1934,18 +2010,7 @@ static uint8_t menu_wait_button(bool_t twobutton_eject, const char *led_msg)
         }
     }
 
-    if (twobutton_eject) {
-        /* Wait 50ms for 2-button press. */
-        for (wait = 0; wait < 50; wait++) {
-            if ((buttons & (B_LEFT|B_RIGHT)) == (B_LEFT|B_RIGHT))
-                b = B_SELECT;
-            if (b & B_SELECT)
-                break;
-            delay_ms(1);
-        }
-    }
-
-    return b;
+    return twobutton_eject ? wait_twobutton_press(b) : b;
 }
 
 static uint8_t noinline display_error(FRESULT fres, uint8_t b)
@@ -1998,7 +2063,7 @@ static bool_t confirm(const char *op)
     snprintf(msg, sizeof(msg), "Confirm %s?", op);
     lcd_write(0, 1, -1, msg);
 
-    while ((b = buttons) == 0)
+    while ((b = menu_wait_button(TRUE, "")) == 0)
         continue;
 
     return (b == B_SELECT);
@@ -2434,21 +2499,22 @@ static int floppy_main(void *unused)
     return 0;
 }
 
-static void cfg_maybe_factory_reset(void)
+static bool_t main_menu_confirm(const char *op)
 {
-    unsigned int i;
-    uint8_t b = buttons;
+    char msg[17];
+    uint8_t b;
 
-    /* Need both LEFT and RIGHT pressed, or SELECT alone. */
-    if ((b != (B_LEFT|B_RIGHT)) && (b != B_SELECT))
-        return;
+    snprintf(msg, sizeof(msg), "Confirm %s?", op);
+    lcd_write(0, 1, -1, msg);
 
-    /* Buttons must be continuously pressed for three seconds. */
-    for (i = 0; (i < 3000) && (buttons == b); i++)
-        delay_ms(1);
-    if (buttons != b)
-        return;
+    while ((b = buttons) == 0)
+        continue;
 
+    return wait_twobutton_press(b) == B_SELECT;
+}
+
+static void factory_reset(void)
+{
     /* Inform user that factory reset is about to occur. */
     switch (display_mode) {
     case DM_LED_7SEG:
@@ -2476,13 +2542,129 @@ static void cfg_maybe_factory_reset(void)
     system_reset();
 }
 
+static void update_firmware(void)
+{
+    /* Power up the backup-register interface and allow writes. */
+    rcc->apb1enr |= RCC_APB1ENR_PWREN | RCC_APB1ENR_BKPEN;
+    pwr->cr |= PWR_CR_DBP;
+
+    /* Indicate to bootloader that we want to perform firmware update. */
+    bkp->dr1[0] = 0xdead;
+    bkp->dr1[1] = 0xbeef;
+
+    /* Reset everything (except backup registers). */
+    system_reset();
+}
+
+static void ff_osd_configure(void)
+{
+    if (!has_osd || !main_menu_confirm("OSD Cnf"))
+        return;
+
+    lcd_write(0, 1, -1, "Exit: Power Off");
+
+    for (;;) {
+        time_t t = time_now();
+        uint8_t b = buttons;
+        if (b == (B_LEFT|B_RIGHT)) {
+            osd_buttons_tx = B_SELECT;
+            /* Wait for two-button release. */
+            while ((time_diff(t, time_now()) < time_ms(1000)) && buttons)
+                continue;
+        } else if (b & (B_LEFT|B_RIGHT)) {
+            /* Wait 50ms for a two-button press. */
+            while ((b == buttons) && (time_diff(t, time_now()) < time_ms(50)))
+                continue;
+            osd_buttons_tx = (buttons == (B_LEFT|B_RIGHT)) ? B_SELECT : b;
+        } else {
+            osd_buttons_tx = b;
+        }
+        /* Hold button-held state for a while to make sure it gets 
+         * transferred to the OSD. */
+        if (osd_buttons_tx)
+            delay_ms(100);
+    }
+}
+
+static void main_menu(void)
+{
+    const static char *menu[] = {
+        "**Main Menu**",
+        "Factory Reset",
+        "Update Firmware",
+        "Configure FF OSD",
+        "Exit",
+    };
+
+    int sel = 0;
+    uint8_t b;
+
+    /* Not available to 7-segment display. */
+    if (display_mode != DM_LCD_OLED)
+        return;
+
+    menu_mode = TRUE;
+
+    for (;;) {
+
+        if (sel < 0)
+            sel += ARRAY_SIZE(menu);
+        if (sel >= ARRAY_SIZE(menu))
+            sel -= ARRAY_SIZE(menu);
+
+        lcd_write(0, 1, -1, menu[sel]);
+        lcd_on();
+
+        /* Wait for buttons to be released. */
+        while (buttons != 0)
+            continue;
+
+        /* Wait for any button to be pressed. */
+        while ((b = buttons) == 0)
+            continue;
+        b = wait_twobutton_press(b);
+
+        if (b & B_LEFT)
+            sel--;
+        if (b & B_RIGHT)
+            sel++;
+
+        if (b & B_SELECT) {
+            /* Wait for buttons to be released. */
+            while (buttons)
+                continue;
+            switch (sel) {
+            case 1: /* Factory Reset */
+                if (main_menu_confirm("Reset"))
+                    factory_reset();
+                break;
+            case 2: /* Update Firmware */
+                if (main_menu_confirm("Update"))
+                    update_firmware();
+                break;
+            case 3: /* Configure FF OSD */
+                ff_osd_configure();
+                break;
+            case 0: case 4: /* Exit */
+                goto out;
+            }
+        }
+ 
+    }
+
+out:
+    menu_mode = FALSE;
+}
+
 static void banner(void)
 {
     switch (display_mode) {
     case DM_LED_7SEG:
         led_7seg_write_string(
-#ifdef LOGFILE
+#if defined(LOGFILE)
             "LOG"
+#elif defined(QUICKDISK)
+            (led_7seg_nr_digits() == 3) ? "Q-D" : "QD"
 #else
             (led_7seg_nr_digits() == 3) ? "F-F" : "FF"
 #endif
@@ -2493,12 +2675,35 @@ static void banner(void)
         lcd_write(0, 0, 0, "FlashFloppy");
         lcd_write(0, 1, 0, "v");
         lcd_write(1, 1, 0, fw_ver);
-#ifdef LOGFILE
+#if defined(LOGFILE)
         lcd_write(10, 1, 0, "[Log]");
+#elif defined(QUICKDISK)
+        lcd_write(10, 1, 0, "[QD]");
 #endif
         lcd_on();
         break;
     }
+}
+
+static void check_buttons(void)
+{
+    unsigned int i;
+    uint8_t b = buttons;
+
+    /* Need both LEFT and RIGHT pressed, or SELECT alone. */
+    if ((b != (B_LEFT|B_RIGHT)) && (b != B_SELECT))
+        return;
+
+    /* Buttons must be continuously pressed for three seconds. */
+    for (i = 0; (i < 3000) && (buttons == b); i++)
+        delay_ms(1);
+
+    if (buttons == b)
+        factory_reset();
+    else
+        main_menu();
+
+    banner();
 }
 
 static void maybe_show_version(void)
@@ -2604,6 +2809,7 @@ int main(void)
     printk("** Keir Fraser <keir.xen@gmail.com>\n");
     printk("** https://github.com/keirf/FlashFloppy\n\n");
 
+    printk("Build: %s %s\n", build_date, build_time);
     printk("Board: %s\n", board_name[board_id]);
 
     speaker_init();
@@ -2642,12 +2848,13 @@ int main(void)
         usbh_msc_buffer_set(arena_alloc(512));
         while ((f_mount(&fatfs, "", 1) != FR_OK) && !cfg.usb_power_fault) {
             maybe_show_version();
-            cfg_maybe_factory_reset();
+            check_buttons();
             usbh_msc_process();
         }
         usbh_msc_buffer_set((void *)0xdeadbeef);
 
         fres = F_call_cancellable(floppy_main, NULL);
+        osd_buttons_tx = 0;
         floppy_cancel();
         floppy_arena_teardown();
 

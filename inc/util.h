@@ -19,9 +19,6 @@ typedef char bool_t;
 #define TRUE 1
 #define FALSE 0
 
-#define LONG_MAX ((long int)((~0UL)>>1))
-#define LONG_MIN ((long int)~LONG_MAX)
-
 #ifndef offsetof
 #define offsetof(a,b) __builtin_offsetof(a,b)
 #endif
@@ -86,6 +83,8 @@ void qsort_p(void *base, unsigned int nr,
              int (*compar)(const void *, const void *));
 
 uint32_t rand(void);
+
+unsigned int popcount(uint32_t x);
 
 int vsnprintf(char *str, size_t size, const char *format, va_list ap)
     __attribute__ ((format (printf, 3, 0)));
@@ -170,6 +169,11 @@ void lcd_backlight(bool_t on);
 void lcd_sync(void);
 extern uint8_t lcd_columns, lcd_rows;
 
+/* FF OSD (On Screen Display) */
+extern bool_t has_osd;
+extern uint8_t osd_buttons_tx; /* Gotek -> FF_OSD */
+extern uint8_t osd_buttons_rx; /* FF_OSD -> Gotek */
+
 /* USB stack processing */
 void usbh_msc_init(void);
 void usbh_msc_buffer_set(uint8_t *buf);
@@ -193,6 +197,8 @@ extern uint8_t board_id;
 
 /* Build info. */
 extern const char fw_ver[];
+extern const char build_date[];
+extern const char build_time[];
 
 /* Text/data/BSS address ranges. */
 extern char _stext[], _etext[];

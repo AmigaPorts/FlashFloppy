@@ -9,6 +9,12 @@
  * See the file COPYING for more details, or visit <http://unlicense.org>.
  */
 
+#ifdef QUICKDISK
+#define is_quickdisk TRUE
+#else
+#define is_quickdisk FALSE
+#endif
+
 #define FINTF_SHUGART     0
 #define FINTF_IBMPC       1
 #define FINTF_IBMPC_HDOUT 2
@@ -46,6 +52,21 @@ struct hfe_image {
     } write;
     struct {
         uint16_t off, len;
+        bool_t dirty;
+    } write_batch;
+};
+
+struct qd_image {
+    uint16_t tb;
+    uint32_t trk_off;
+    uint32_t trk_pos, trk_len;
+    uint32_t win_start, win_end;
+    struct {
+        uint32_t start;
+        bool_t wrapped;
+    } write;
+    struct {
+        uint32_t off, len;
         bool_t dirty;
     } write_batch;
 };
@@ -160,6 +181,7 @@ struct image {
     union {
         struct adf_image adf;
         struct hfe_image hfe;
+        struct qd_image qd;
         struct img_image img;
         struct dsk_image dsk;
         struct directaccess da;
